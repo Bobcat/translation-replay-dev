@@ -279,6 +279,10 @@ export function createPdfTranslationView() {
                   <span>Other calls (prompts + responses)</span>
                   <textarea id="pdfOtherCalls" rows="8" spellcheck="false" placeholder="Every other call this page made, in order, with its role — the island batch, hint-line and per-unit calls."></textarea>
                 </label>
+                <label class="translation-prompts-field translation-prompts-field-response">
+                  <span>Font detection — document batches</span>
+                  <textarea id="pdfFontCalls" rows="8" spellcheck="false" placeholder="Document-wide font-region calls, with each prompt, response and duration."></textarea>
+                </label>
               </div>
             </details>
             <!-- Freeze this completed run as a document regression fixture (frozen per-page
@@ -405,6 +409,7 @@ export function createPdfTranslationView() {
     xlateInput: container.querySelector('#pdfXlateInput'),
     xlateResponse: container.querySelector('#pdfXlateResponse'),
     other: container.querySelector('#pdfOtherCalls'),
+    font: container.querySelector('#pdfFontCalls'),
   };
   const regInfoEl = container.querySelector('#pdfRegInfo');
   const regSubdirSel = container.querySelector('#pdfRegSubdir');
@@ -961,6 +966,8 @@ export function createPdfTranslationView() {
     clearOutputPreview();
     clearCallFields();
     callsLoadedFor = '';
+    fontCallsLoadedFor = '';
+    lastCallsResult = null;
     callsStatusEl.textContent = '';
     isInspectingHistory = true;
     historyOptionsAvailable = false;
@@ -1210,8 +1217,8 @@ export function createPdfTranslationView() {
       const timings = result?.timings || {};
       const pages = result?.response?.document?.pages || [];
       const total = m.translate_pdf_total_wall_ms;
-      // Only render and assemble are summed on the document response; the earlier stages are
-      // per page, so sum them here across pages for the whole-document breakdown.
+      // Font detection, render and assemble are document-level; the other stages are per page,
+      // so sum those here across pages for the whole-document breakdown.
       const sum = (key) => {
         const vals = pages.map((p) => p?.metrics?.[key]).filter((v) => typeof v === 'number');
         return vals.length ? vals.reduce((a, b) => a + b, 0) : undefined;
@@ -1221,11 +1228,14 @@ export function createPdfTranslationView() {
       // total. Sharing each stage against the elapsed total would print percentages over 100 that
       // are only that sum in disguise (they are the work shares scaled by one constant factor), so
       // share against the stage sum instead and state the factor once, on its own row.
+      const fontCallCount = Number(m.font_detection_call_count || 0);
+      const fontRegionCount = Number(m.font_region_count || 0);
       const stages = [
         ['OCR', sum('ocr_wall_ms')],
         ['Grouping (VLM)', sum('grouping_wall_ms')],
         ['Layout', sum('layout_wall_ms')],
         ['Align', sum('align_wall_ms')],
+        ...(fontCallCount > 0 ? [['Font detection (VLM)', m.font_detection_wall_ms]] : []),
         ['Translation', sum('translation_wall_ms')],
         ['Render', typeof m.replacement_wall_ms_total === 'number' ? m.replacement_wall_ms_total : sum('replacement_wall_ms')],
         ['Assemble PDF', m.assemble_wall_ms],
@@ -1269,6 +1279,10 @@ export function createPdfTranslationView() {
             'The queue taken out. Still not a speed-up: a page costs measurably more work under contention than it does alone, so this multiplier rises as the GPU gets busier — the opposite of what it looks like.')
           : '',
         ...stages.map(stage),
+        fontCallCount > 0
+          ? row('Font model calls', `${fontCallCount} · ${fontRegionCount} regions`, 'trt-l1',
+            'Small text-region crops are batched document-wide; the timing above is elapsed stage time, not the sum of concurrently running calls.')
+          : '',
         // Deliberately outside `stages`: the debug overlay is not a step of producing the
         // translation, and folding it in would move every share and the multiplier above,
         // so the same run would read differently for having been inspected. Present only
@@ -1294,6 +1308,7 @@ export function createPdfTranslationView() {
 
     const page = (result?.response?.document?.pages || []).find((p) => String(p.page) === String(timingsScopeValue));
     const m = page?.metrics || {};
+    const documentMetrics = result?.response?.metrics || {};
     const total = m.translate_image_total_wall_ms;
     // Stage row with its share of the page total — the same breakdown the image view shows.
     const stage = (label, v) => {
@@ -1309,6 +1324,14 @@ export function createPdfTranslationView() {
       stage('Align', m.align_wall_ms),
       stage('Translation', m.translation_wall_ms),
       stage('Render', m.replacement_wall_ms),
+      Number(documentMetrics.font_detection_call_count || 0) > 0
+        ? row(
+          'Font detection (document)',
+          `${ms(documentMetrics.font_detection_wall_ms)} · ${Number(documentMetrics.font_detection_call_count)} calls`,
+          'trt-l1',
+          'This model stage is batched across the document and is therefore not part of this page total.',
+        )
+        : '',
     ].join('');
   }
 
@@ -1321,6 +1344,8 @@ export function createPdfTranslationView() {
   // studying one page across renders, and being thrown back to page 1 each time defeats that.
   let callsPage = 0;
   let callsLoadedFor = '';
+  let fontCallsLoadedFor = '';
+  let lastCallsResult = null;
 
   function pagesWithCalls(result) {
     const artifacts = result?.response?.artifacts || {};
@@ -1332,6 +1357,12 @@ export function createPdfTranslationView() {
   }
 
   function syncCallsSection(result) {
+    lastCallsResult = result;
+    const requestId = String(result?.request_id || currentRequestId || '');
+    if (fontCallsLoadedFor !== requestId) {
+      fontCallsLoadedFor = '';
+      callEls.font.value = '';
+    }
     const pages = pagesWithCalls(result);
     if (!pages.length) {
       callsPageSelect.innerHTML = '';
@@ -1361,7 +1392,7 @@ export function createPdfTranslationView() {
     const page = parseInt(callsPageSelect.value || '0', 10);
     if (!requestId || !page) return;
     const key = `${requestId}|${page}`;
-    if (callsLoadedFor === key) return;
+    if (callsLoadedFor === key && fontCallsLoadedFor === requestId) return;
     callsStatusEl.textContent = 'Loading…';
     try {
       const name = `page-${String(page).padStart(3, '0')}-llm-calls`;
@@ -1370,11 +1401,39 @@ export function createPdfTranslationView() {
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       fillCallFields(await response.json());
       callsLoadedFor = key;
-      callsStatusEl.textContent = '';
+      callsStatusEl.textContent = await loadFontCallsForRequest(requestId);
     } catch (err) {
       clearCallFields();
       callsLoadedFor = '';
+      fontCallsLoadedFor = '';
       callsStatusEl.textContent = `Could not load page ${page}: ${err.message || err}`;
+    }
+  }
+
+  async function loadFontCallsForRequest(requestId) {
+    if (fontCallsLoadedFor === requestId) return '';
+    const artifact = lastCallsResult?.response?.artifacts?.['font-region-llm-calls'];
+    if (!artifact) {
+      callEls.font.value = '(none — this run made no document-wide font-region calls)';
+      fontCallsLoadedFor = requestId;
+      return '';
+    }
+    try {
+      const name = 'font-region-llm-calls';
+      const url = `/api/pdf-translation/requests/${encodeURIComponent(requestId)}/artifacts/${name}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      const calls = Array.isArray(payload?.calls) ? payload.calls : [];
+      callEls.font.value = calls.length
+        ? calls.map(formatFontCall).join('\n\n──────────\n\n')
+        : '(none — the font-region call log is empty)';
+      fontCallsLoadedFor = requestId;
+      return '';
+    } catch (err) {
+      callEls.font.value = '';
+      fontCallsLoadedFor = '';
+      return `Could not load document font calls: ${err.message || err}`;
     }
   }
 
@@ -1416,15 +1475,31 @@ export function createPdfTranslationView() {
     return String(response || call?.error || '');
   }
 
-  function formatCall(call) {
+  function formatCall(call, context = '') {
     const system = String(call?.payload?.instructions || '');
     const ms = call?.wall_ms;
     return [
       `# ${String(call?.role || 'call')}${typeof ms === 'number' ? `   (${(ms / 1000).toFixed(2)}s)` : ''}`,
+      context,
       system ? `[system]\n${system}` : '',
       `[input]\n${callInputText(call)}`,
       `[response]\n${callResponseText(call)}`,
     ].filter(Boolean).join('\n');
+  }
+
+  function formatFontCall(call) {
+    const regionIds = Array.isArray(call?.region_ids) ? call.region_ids : [];
+    const mapping = regionIds
+      .map((id, index) => `R${String(index + 1).padStart(2, '0')}=${String(id)}`)
+      .join(', ');
+    const parsed = Number(call?.parsed_region_count);
+    const batch = String(call?.batch || 'montage');
+    const context = [
+      `[image batch]\n${batch}`,
+      mapping ? `[regions]\n${mapping}` : '',
+      Number.isFinite(parsed) ? `[parsed]\n${parsed}/${regionIds.length}` : '',
+    ].filter(Boolean).join('\n');
+    return formatCall(call, context);
   }
 
   callsPageSelect.addEventListener('change', () => {
@@ -1706,6 +1781,8 @@ export function createPdfTranslationView() {
     callsPageSelect.innerHTML = '';
     callsStatusEl.textContent = '';
     callsLoadedFor = '';
+    fontCallsLoadedFor = '';
+    lastCallsResult = null;
     clearCallFields();
     timingsScope.innerHTML = '';
     timingsEl.innerHTML = '';
